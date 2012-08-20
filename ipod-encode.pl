@@ -9,9 +9,9 @@ iPod::Video::Encode
 
 =head1 SYNOPSIS
 
-./vcode --title='A Title' [--debug] [--verbose] [--number-pattern=regex] video-1 [... video-n]
+./ipod-encode.pl --title='A Title' [--debug] [--verbose] [--number-pattern=regex] video-1 [... video-n]
 
-./vcode --title='Another Title' [--debug] [--verbose] --standalone video-file
+./ipod-encode.pl --title='Another Title' [--debug] [--verbose] --standalone video-file
 
 =head1 DESCRIPTION
 
@@ -46,6 +46,8 @@ Switch on chatty logging (not quite as much as --debug).
 =item --debug
 
 Switch on fine tracing of execution, and provide more information in crashes.
+
+=back
 
 =head1 AUTHOR
 
@@ -93,6 +95,33 @@ sub unique_filename_for
   return $filename;
 }
 
+=head2 encode
+
+Given a source video filename and a title, transcodes the source to a new
+file based on the title--with an "m4v" extension--that is compatible for
+playback on the iPod Touch or iPhone.  The supplied title may be further
+decorated to ensure that the output filename does not overwrite another file.
+
+Additional key/value parameters can be used to refine the process.  Currently
+available parameters are:
+
+=over 4
+
+=item vbitrate => a-rate
+
+The video bitrate to use.  The default is 786432 (768 kbits/second)
+
+=item overwrite => 1
+
+If specified (default is 0), the output video file will overwrite another
+file of the same name, if it already exists.  The temporary files created
+by this function will always be uniquely named, and cannot be specified to
+overwrite.
+
+=back
+
+=cut
+
 sub encode
 {
   my ($source, $title, %options) = @_;
@@ -101,7 +130,9 @@ sub encode
   my $logger = Log::Log4perl->get_logger;
   my $fifo = unique_filename_for($source_filename, 'fifo');
   my $intermediate = unique_filename_for($source_filename, 'avi');
-  my $destination = unique_filename_for($title, 'm4v');
+  my $destination = $options{overwrite} ?
+    "$title.m4v" :
+    unique_filename_for($title, 'm4v');
   my $vbitrate = $options{vbitrate} || '768k';
 
   $logger->info('Encoding \'', $source, '\' to \'', $destination, '\'');
@@ -193,7 +224,7 @@ sub encode
     }
   }
 
-  unless ( $mplayer_failed | $ffmpeg_failed )
+  unless ( $mplayer_failed || $ffmpeg_failed )
   {
     my @command = ('ffmpeg',
                    '-i', $source,
@@ -217,6 +248,21 @@ sub encode
   }
 }
 
+=head2 numbered_title_for
+
+Given a base title and a filename, attempts to locate an episode number in
+the filename that can be used to assemble a filename based on the title, e.g.:
+
+ numbered_title_for('my video', '/tmp/source-video-01.avi');
+
+returns 'my video-1'
+
+The default regex used internally by this method is good enough for just about
+anything, but if you have something that's particularly tricky, you can
+supply an appropriate regex as a third argument.
+
+=cut
+
 sub numbered_title_for
 {
   my ($base_title, $filename, $number_pattern) = @_;
@@ -229,6 +275,13 @@ sub numbered_title_for
   $logger->debug('Title for \'', $filename, '\' is \'', $decorated_title, '\', extracted using \'', $number_pattern, '\'');
   return $decorated_title;
 }
+
+=head2 standalone_title_for
+
+Given a title and a filename, just returns the title.  This is useful as the
+identity function for when a title generator function is required.
+
+=cut
 
 sub standalone_title_for
 {
