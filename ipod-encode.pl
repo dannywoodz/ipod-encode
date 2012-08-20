@@ -69,6 +69,7 @@ use POSIX qw(mkfifo);
 use File::Spec;
 use File::Basename;
 use Carp;
+use v5.12;
 use utf8;
 use strict;
 use warnings;
@@ -88,7 +89,7 @@ sub unique_filename_for
   my ($base, $extension) = @_;
   my $filename = $base . '.' . $extension;
   my $tries = 1;
-  $filename = $base . '-' . $tries++ . $extension while -e $filename;
+  $filename = $base . '-' . $tries++ . '.' . $extension while -e $filename;
   return $filename;
 }
 
@@ -98,12 +99,10 @@ sub encode
 
   my ($vol, $dir, $source_filename) = File::Spec->splitpath($source);
   my $logger = Log::Log4perl->get_logger;
-  my $fifo = unique_filename_for('.' . $source_filename, 'fifo');
+  my $fifo = unique_filename_for($source_filename, 'fifo');
   my $intermediate = unique_filename_for($source_filename, 'avi');
   my $destination = unique_filename_for($title, 'm4v');
   my $vbitrate = $options{vbitrate} || '768k';
-  my $encode_pid;
-  my $encode_status;
 
   $logger->info('Encoding \'', $source, '\' to \'', $destination, '\'');
 
@@ -118,8 +117,11 @@ sub encode
 
   mkfifo($fifo, 0700) and push(@g_cleanup_list, $fifo) or die $!;
 
-  if ($encode_pid = fork())
+  my $mplayer = fork();
+
+  if ( !$mplayer )
   {
+    # mplayer child process
     my @command = ('mplayer', $source,
                    '-noconfig', 'all',
                    '-vf-clr',
@@ -129,12 +131,15 @@ sub encode
                    '-vf', 'scale=480:-10',
                    '-vo', "yuv4mpeg:file=\"$fifo\"");
     $logger->info('Executing ', join(' ', @command));
-    croak unless system(@command) >> 8 == 0;
-    waitpid($encode_pid, 0);
-    $encode_status = $?;
+    {exec(@command)}
+    croak('mplayer exec failed: ' . join(' ', @command));
   }
-  else
+
+  my $ffmpeg  = fork();
+
+  if ( !$ffmpeg )
   {
+    # ffmpeg child process
     my @command = ('ffmpeg',
                    '-i', $fifo,
                    '-vcodec', 'libx264',
@@ -162,12 +167,33 @@ sub encode
                    $intermediate);
     $logger->info('Executing ', join(' ', @command));
     {exec(@command)}
-    croak("exec failed on " . join(' ', @command));
+    croak('ffmpeg exec failed on ' . join(' ', @command));
   }
 
   push(@g_cleanup_list, $intermediate);
 
-  if ( $encode_status == 0 )
+  my $mplayer_failed = 0;
+  my $ffmpeg_failed  = 0;
+
+  while ( $ffmpeg || $mplayer )
+  {
+    my $child_pid = wait;
+    given($child_pid)
+    {
+      when ($ffmpeg)  {
+        $ffmpeg  = 0;
+        $ffmpeg_failed = $?;
+        kill(15, $mplayer) if $ffmpeg_failed && $mplayer;
+      }
+      when ($mplayer) {
+        $mplayer = 0;
+        $mplayer_failed = $?;
+        kill(15, $ffmpeg) if $mplayer_failed && $ffmpeg;
+      }
+    }
+  }
+
+  unless ( $mplayer_failed | $ffmpeg_failed )
   {
     my @command = ('ffmpeg',
                    '-i', $source,
@@ -182,24 +208,25 @@ sub encode
                    '-metadata', "title=$title",
                    '-y', $destination);
     $logger->info('Executing ', join(' ', @command));
-    croak unless system(@command) >> 8 == 0;
+    croak('ffmpeg multiplex failed') unless system(@command) >> 8 == 0;
     unlink($intermediate);
   }
   else
   {
-    print $logger->warn('Not multiplexing, as earlier phase failed (code ', $encode_status, ')');
+    $logger->warn('Not multiplexing, as earlier phase failed (mplayer: ', $mplayer_failed, '; ffmpeg: ', $ffmpeg_failed, ')');
   }
 }
 
 sub numbered_title_for
 {
   my ($base_title, $filename, $number_pattern) = @_;
-        $filename = basename($filename); # Don't snag numbers in the directory name
+  my $logger = Log::Log4perl->get_logger;
+  $filename = basename($filename); # Don't snag numbers in the directory name
   $number_pattern ||= DEFAULT_NUMBER_PATTERN;
   my $decorated_title = ( $filename =~ $number_pattern ) ?
     $base_title . '-' . $1 :
     croak("Unable to extract episode number from '$filename' using '$number_pattern'");
-  Log::Log4perl->get_logger->debug('Title for \'', $filename, '\' is \'', $decorated_title, '\', extracted using \'', $number_pattern, '\'');
+  $logger->debug('Title for \'', $filename, '\' is \'', $decorated_title, '\', extracted using \'', $number_pattern, '\'');
   return $decorated_title;
 }
 
