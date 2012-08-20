@@ -6,6 +6,9 @@ Script to drive ffmpeg and mplayer for iPod/iPhone video transcoding
 Installation
 ------------
 
+This script does not work on Windows, as it makes use of Perl's &POSIX::mkfifo. I've tested
+it with both OS X and Linux, and it's fine on both.
+
 You're going to need both ffmpeg and mplayer installed and in your PATH.
 
 The non-core Log::Log4perl module is used in the script, so you should obtain that from CPAN.
