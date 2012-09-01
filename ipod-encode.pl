@@ -159,6 +159,7 @@ sub encode
                    '-nosound',
                    '-benchmark',
                    '-ass',
+                   '-ass-font-scale', '1.3',
                    '-vf', 'scale=480:-10',
                    '-vo', "yuv4mpeg:file=\"$fifo\"");
     $logger->info('Executing ', join(' ', @command));
