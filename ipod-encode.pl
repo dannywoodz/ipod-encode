@@ -32,6 +32,10 @@ When running over multiple files (the default), the number pattern is used
 to extract the episode number.  The default is /[_\W]0*(\d+)/, which catches
 almost everything, but you can specify your own here.
 
+If 'generate' is specified instead of a regular expression, the videos are incrementally
+numbered as they are encoded.  Videos are always encoded in the same order that they are
+specified on the command line.
+
 =item --standalone
 
 It's normally assumed that this program will be operating over a group of
@@ -66,7 +70,6 @@ GPLv3 (http://opensource.org/licenses/GPL-3.0)
 package iPod::Video::Encode;
 
 use Getopt::Long qw(GetOptionsFromArray);
-use Log::Log4perl qw(:levels);
 use POSIX qw(mkfifo);
 use File::Spec;
 use File::Basename;
@@ -76,6 +79,30 @@ use utf8;
 use strict;
 use warnings;
 use constant DEFAULT_NUMBER_PATTERN => qr/[_\W]0*(\d+)/;
+
+use constant LOG_DEBUG => 1;
+use constant LOG_INFO  => 2;
+use constant LOG_WARN  => 3;
+use constant LOG_ERROR => 4;
+use constant LOG_FATAL => 5;
+use constant LOG_SET   => 100;
+
+sub logger
+{
+  my $threshold = shift || LOG_WARN;
+  my $handle    = shift || \*STDOUT;
+  return sub {
+    my ($level, $fmt, @args) = @_;
+    return if $level < $threshold;
+    return ($threshold = $fmt) if $level == LOG_SET;
+    printf $handle "$fmt\n", @args;
+  };
+}
+
+sub null_logger
+{
+  return sub {};
+}
 
 my @g_cleanup_list;
 
@@ -124,10 +151,11 @@ overwrite.
 
 sub encode
 {
-  my ($source, $title, %options) = @_;
+  my ($source, $title, $logger, %options) = @_;
+
+  $logger ||= null_logger();
 
   my ($vol, $dir, $source_filename) = File::Spec->splitpath($source);
-  my $logger = Log::Log4perl->get_logger;
   my $fifo = unique_filename_for($source_filename, 'fifo');
   my $intermediate = unique_filename_for($source_filename, 'avi');
   my $destination = $options{overwrite} ?
@@ -135,7 +163,7 @@ sub encode
     unique_filename_for($title, 'm4v');
   my $vbitrate = $options{vbitrate} || '768k';
 
-  $logger->info('Encoding \'', $source, '\' to \'', $destination, '\'');
+  $logger->(LOG_INFO, q(Encoding '%s' to '%s'), $source, $destination);
 
   #############################################################################
   # It might seem like a better idea to use Perl as the intermediary between
@@ -162,7 +190,7 @@ sub encode
                    '-ass-font-scale', '1.3',
                    '-vf', 'scale=480:-10',
                    '-vo', "yuv4mpeg:file=\"$fifo\"");
-    $logger->info('Executing ', join(' ', @command));
+    $logger->(LOG_INFO, 'Executing "%s"', join(' ', @command));
     {exec(@command)}
     croak('mplayer exec failed: ' . join(' ', @command));
   }
@@ -197,7 +225,7 @@ sub encode
                    '-qdiff','4',
                    '-y',
                    $intermediate);
-    $logger->info('Executing ', join(' ', @command));
+    $logger->(LOG_INFO, 'Executing "%s"', join(' ', @command));
     {exec(@command)}
     croak('ffmpeg exec failed on ' . join(' ', @command));
   }
@@ -239,13 +267,14 @@ sub encode
                    '-map', '1:v',
                    '-metadata', "title=$title",
                    '-y', $destination);
-    $logger->info('Executing ', join(' ', @command));
+    $logger->(LOG_INFO, 'Executing "%s"', join(' ', @command));
     croak('ffmpeg multiplex failed') unless system(@command) >> 8 == 0;
     unlink($intermediate);
   }
   else
   {
-    $logger->warn('Not multiplexing, as earlier phase failed (mplayer: ', $mplayer_failed, '; ffmpeg: ', $ffmpeg_failed, ')');
+    $logger->(LOG_WARN, 'Not multiplexing, as earlier phase failed (mplayer: %d; ffmpeg: %d)',
+              $mplayer_failed, $ffmpeg_failed);
   }
 }
 
@@ -266,14 +295,25 @@ supply an appropriate regex as a third argument.
 
 sub numbered_title_for
 {
-  my ($base_title, $filename, $number_pattern) = @_;
-  my $logger = Log::Log4perl->get_logger;
-  $filename = basename($filename); # Don't snag numbers in the directory name
-  $number_pattern ||= DEFAULT_NUMBER_PATTERN;
-  my $decorated_title = ( $filename =~ $number_pattern ) ?
-    $base_title . '-' . $1 :
-    croak("Unable to extract episode number from '$filename' using '$number_pattern'");
-  $logger->debug('Title for \'', $filename, '\' is \'', $decorated_title, '\', extracted using \'', $number_pattern, '\'');
+  my ($base_title, $filename, $number_finder, $logger) = @_;
+
+  $logger            ||= null_logger();
+  $filename            = basename($filename);
+  $number_finder     ||= build_number_extractor();
+
+  my $number           = $number_finder->($filename);
+
+  if ( !defined($number) )
+  {
+    croak(sprintf("Unable to extract episode number from '%s' using '%s'",
+                  $filename, $number_finder->()));
+  }
+
+  my $decorated_title  = $base_title . '-' . $number;
+
+  $logger->(LOG_DEBUG, q(Title for '%s' is '%s', extracted using '%s'),
+            $filename, $decorated_title, $number_finder->());
+
   return $decorated_title;
 }
 
@@ -289,25 +329,72 @@ sub standalone_title_for
   return shift;
 }
 
+=head2 build_number_extractor
+
+Build a subroutine suitable for extracting episode numbers from a string
+to be supplied to it.  If no arguments are supplied, the returned sub
+will use DEFAULT_NUMBER_PATTERN.  If the string 'generate' is supplied,
+each call to the returned sub will yield an incrementing number.
+Otherwise, the string supplied is treated as regular expression for the
+returned sub to use.
+
+In each case, calling the returned sub without any arguments will return
+either the regex it's using, or the string 'generate', when that is
+being used.
+
+=cut
+
+sub build_number_extractor
+{
+  my $string = shift;
+
+  if ( defined($string) )
+  {
+    if ( $string eq 'generate' )
+    {
+      my $index = 1;
+      return sub {
+        return (@_) ? $index++ : 'generate';
+      };
+    }
+    else
+    {
+      my $regex = qr/$string/;
+      return sub {
+        return (@_) ? do {
+          shift =~ $regex;
+          return $1;
+        } : $regex;
+      };
+    }
+  }
+
+  return build_number_extractor(DEFAULT_NUMBER_PATTERN);
+}
+
 sub main
 {
-  Log::Log4perl->init(\*DATA);
-
-  my $logger = Log::Log4perl->get_logger;
-  my $number_pattern = DEFAULT_NUMBER_PATTERN;
+  my $logger = logger();
+  my $number_finder = build_number_extractor();
   my $title;
   my @pairs;
   my $title_generator = \&numbered_title_for;
 
   GetOptionsFromArray(\@_,
-                      'debug'   => sub {
+                      'debug'            => sub {
                         $Carp::Verbose = 1;
-                        $logger->level($DEBUG);
+                        $logger->(LOG_SET, LOG_DEBUG);
                       },
-                      'standalone' => sub { $title_generator = \&standalone_title_for },
-                      'title=s' => \$title,
-                      'number-pattern=s' => sub { $number_pattern = qr/$_[1]/ },
-                      'verbose' => sub { $logger->level($INFO) });
+                      'standalone'       => sub {
+                        $title_generator = \&standalone_title_for;
+                      },
+                      'title=s'          => \$title,
+                      'number-pattern=s' => sub {
+                        $number_finder = build_number_extractor($_[1]);
+                      },
+                      'verbose'          => sub {
+                        $logger->(LOG_SET, LOG_INFO)
+                      });
 
   croak('Missing --title') unless $title;
 
@@ -317,15 +404,13 @@ sub main
   # the second item.  They're also stored in an array, as ordering is
   # useful.
 
-  encode(@$_) for map { [ $_, $title_generator->($title, $_, $number_pattern) ] } @_;
+  my @jobs = map { [ $_,
+                     $title_generator->($title, $_, $number_finder, $logger),
+                     $logger ] } @_;
+
+  encode(@$_) for @jobs;
 }
 
 main(@ARGV) unless caller;
 
 1;
-
-__DATA__
-log4perl.rootLogger=WARN,Screen
-log4perl.appender.Screen=Log::Log4perl::Appender::Screen
-log4perl.appender.Screen.layout=PatternLayout
-log4perl.appender.Screen.layout.ConversionPattern=%m%n

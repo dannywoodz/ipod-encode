@@ -11,9 +11,10 @@ it with both OS X and Linux, and it's fine on both.
 
 You're going to need both ffmpeg and mplayer installed and in your PATH.
 
-The non-core Log::Log4perl module is used in the script, so you should obtain that from CPAN.
+mplayer should have the required codec support to be able to play your source video;
+ffmpeg should have libx264 and libfaac support in order to create compliant videos.
 
-If you have the two programs and the module, all you need is the script
+If you have these two programs, all you need is the script (and a Perl interpreter!)
 
 Running
 -------
@@ -38,6 +39,9 @@ will produce 'My Title-1.m4v', 'My Title-2.m4v' and 'My Title-3.m4v'.
 
 The numbers are extracted using a regular expression that can be overridden with the
 --number-pattern switch.  The default is usually good enough (see the code for details).
+
+If you don't care about the numbering, the special 'generate' --number-pattern can
+tag each output file with an incrementing number instead.
 
 ### Standalone Mode
 
