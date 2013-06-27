@@ -186,8 +186,8 @@ sub encode
                    '-vf-clr',
                    '-nosound',
                    '-benchmark',
-                   '-ass',
-                   '-ass-font-scale', '1.3',
+                   #'-ass',
+                   #'-ass-font-scale', '1.3',
                    '-vf', 'scale=480:-10',
                    '-vo', "yuv4mpeg:file=\"$fifo\"");
     $logger->(LOG_INFO, 'Executing "%s"', join(' ', @command));
@@ -238,18 +238,17 @@ sub encode
   while ( $ffmpeg || $mplayer )
   {
     my $child_pid = wait;
-    given($child_pid)
+    if ( $child_pid == $ffmpeg )
     {
-      when ($ffmpeg)  {
-        $ffmpeg  = 0;
-        $ffmpeg_failed = $?;
-        kill(15, $mplayer) if $ffmpeg_failed && $mplayer;
-      }
-      when ($mplayer) {
-        $mplayer = 0;
-        $mplayer_failed = $?;
-        kill(15, $ffmpeg) if $mplayer_failed && $ffmpeg;
-      }
+      $ffmpeg  = 0;
+      $ffmpeg_failed = $?;
+      kill(15, $mplayer) if $ffmpeg_failed && $mplayer;
+    }
+    elsif ( $child_pid == $mplayer )
+    {
+      $mplayer = 0;
+      $mplayer_failed = $?;
+      kill(15, $ffmpeg) if $mplayer_failed && $ffmpeg;
     }
   }
 
