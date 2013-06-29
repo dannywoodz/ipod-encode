@@ -104,15 +104,6 @@ sub null_logger
   return sub {};
 }
 
-my @g_cleanup_list;
-
-END {
-  foreach my $file(@g_cleanup_list)
-  {
-    unlink($file) if -e $file;
-  }
-};
-
 sub unique_filename_for
 {
   my ($base, $extension) = @_;
@@ -120,6 +111,43 @@ sub unique_filename_for
   my $tries = 1;
   $filename = $base . '-' . $tries++ . '.' . $extension while -e $filename;
   return $filename;
+}
+
+=head2 parse_bitrate
+
+A convenience function for returning a numeric bitrate for a supplied
+string.  The string itself an be a pure number (e.g. 786432), which is
+interpreted literally.  'k', 'm', and 'g' suffixes are interpreted as
+you'd expect, as are their capitalisations
+
+=cut
+
+sub parse_bitrate
+{
+  my ($digits, $suffix) = shift =~ m/^(\d+)([kmg])?$/i;
+  my $multipliers = { k => (1 << 10), m => (1 << 20), g => (1 << 30) };
+  return $suffix ? $digits * $multipliers->{lc($suffix)} : $digits;
+}
+
+=head2 with_cleanup_list
+
+A convenience function to provide a list to an enclosed function.
+The function can append filenames to the list, and they'll be
+deleted automatically when the function executes.
+
+=cut
+
+sub with_cleanup_list(&) {
+  my @cleanup_list;
+  eval {
+    shift->(\@cleanup_list);
+  };
+  my $error = $@;
+  while(my $file = pop(@cleanup_list))
+  {
+    unlink($file) if -e $file;
+  }
+  die $error if $error;
 }
 
 =head2 encode
@@ -161,7 +189,7 @@ sub encode
   my $destination = $options{overwrite} ?
     "$title.m4v" :
     unique_filename_for($title, 'm4v');
-  my $vbitrate = $options{vbitrate} || '768k';
+  my $vbitrate = parse_bitrate($options{vbitrate} || '768k');
 
   $logger->(LOG_INFO, q(Encoding '%s' to '%s'), $source, $destination);
 
@@ -174,107 +202,110 @@ sub encode
   #     # mplayer devs reccomend using mkfifo (named pipe) instead of stdout.
   #############################################################################
 
-  mkfifo($fifo, 0700) and push(@g_cleanup_list, $fifo) or die $!;
+  with_cleanup_list {
+    my $cleanup_list = shift;
+    mkfifo($fifo, 0700) and push(@$cleanup_list, $fifo) or die $!;
 
-  my $mplayer = fork();
+    my $mplayer = fork();
 
-  if ( !$mplayer )
-  {
-    # mplayer child process
-    my @command = ('mplayer', $source,
-                   '-noconfig', 'all',
-                   '-vf-clr',
-                   '-nosound',
-                   '-benchmark',
-                   #'-ass',
-                   #'-ass-font-scale', '1.3',
-                   '-vf', 'scale=480:-10',
-                   '-vo', "yuv4mpeg:file=\"$fifo\"");
-    $logger->(LOG_INFO, 'Executing "%s"', join(' ', @command));
-    {exec(@command)}
-    croak('mplayer exec failed: ' . join(' ', @command));
-  }
-
-  my $ffmpeg  = fork();
-
-  if ( !$ffmpeg )
-  {
-    # ffmpeg child process
-    my @command = ('ffmpeg',
-                   '-i', $fifo,
-                   '-vcodec', 'libx264',
-                   '-b:v', $vbitrate,
-                   '-flags', '+loop+mv4',
-                   '-cmp', '256',
-                   '-partitions','+parti4x4+parti8x8+partp4x4+partp8x8+partb8x8',
-                   '-me_method', 'hex',
-                   '-subq', '7',
-                   '-threads', 'auto',
-                   '-trellis', '1',
-                   '-refs', '5',
-                   '-bf', '0',
-                   '-coder', '0',
-                   '-me_range', '16',
-                   '-profile:v', 'baseline',
-                   '-g', '250',
-                   '-keyint_min', '25',
-                   '-sc_threshold', '40',
-                   '-i_qfactor', '0.71',
-                   '-qmin', '10',
-                   '-qmax', '51',
-                   '-qdiff','4',
-                   '-y',
-                   $intermediate);
-    $logger->(LOG_INFO, 'Executing "%s"', join(' ', @command));
-    {exec(@command)}
-    croak('ffmpeg exec failed on ' . join(' ', @command));
-  }
-
-  push(@g_cleanup_list, $intermediate);
-
-  my $mplayer_failed = 0;
-  my $ffmpeg_failed  = 0;
-
-  while ( $ffmpeg || $mplayer )
-  {
-    my $child_pid = wait;
-    if ( $child_pid == $ffmpeg )
+    if ( !$mplayer )
     {
-      $ffmpeg  = 0;
-      $ffmpeg_failed = $?;
-      kill(15, $mplayer) if $ffmpeg_failed && $mplayer;
+      # mplayer child process
+      my @command = ('mplayer', $source,
+                     '-noconfig', 'all',
+                     '-vf-clr',
+                     '-nosound',
+                     '-benchmark',
+                     '-ass',
+                     '-ass-font-scale', '1.3',
+                     '-vf', 'scale=480:-10',
+                     '-vo', "yuv4mpeg:file=\"$fifo\"");
+      $logger->(LOG_INFO, 'Executing "%s"', join(' ', @command));
+      {exec(@command)}
+      croak('mplayer exec failed: ' . join(' ', @command));
     }
-    elsif ( $child_pid == $mplayer )
-    {
-      $mplayer = 0;
-      $mplayer_failed = $?;
-      kill(15, $ffmpeg) if $mplayer_failed && $ffmpeg;
-    }
-  }
 
-  unless ( $mplayer_failed || $ffmpeg_failed )
-  {
-    my @command = ('ffmpeg',
-                   '-i', $source,
-                   '-i', $intermediate,
-                   '-acodec', 'libfaac',
-                   '-b:a', '128k',
-                   '-ac', '2',
-                   '-vcodec', 'copy',
-                   '-f', 'ipod',
-                   '-map', '0:a',
-                   '-map', '1:v',
-                   '-metadata', "title=$title",
-                   '-y', $destination);
-    $logger->(LOG_INFO, 'Executing "%s"', join(' ', @command));
-    croak('ffmpeg multiplex failed') unless system(@command) >> 8 == 0;
-    unlink($intermediate);
-  }
-  else
-  {
-    $logger->(LOG_WARN, 'Not multiplexing, as earlier phase failed (mplayer: %d; ffmpeg: %d)',
-              $mplayer_failed, $ffmpeg_failed);
-  }
+    my $ffmpeg  = fork();
+
+    if ( !$ffmpeg )
+    {
+      # ffmpeg child process
+      my @command = ('ffmpeg',
+                     '-i', $fifo,
+                     '-vcodec', 'libx264',
+                     '-b:v', $vbitrate,
+                     '-flags', '+loop+mv4',
+                     '-cmp', '256',
+                     '-partitions','+parti4x4+parti8x8+partp4x4+partp8x8+partb8x8',
+                     '-me_method', 'hex',
+                     '-subq', '7',
+                     '-threads', 'auto',
+                     '-trellis', '1',
+                     '-refs', '5',
+                     '-bf', '0',
+                     '-coder', '0',
+                     '-me_range', '16',
+                     '-profile:v', 'baseline',
+                     '-g', '250',
+                     '-keyint_min', '25',
+                     '-sc_threshold', '40',
+                     '-i_qfactor', '0.71',
+                     '-qmin', '10',
+                     '-qmax', '51',
+                     '-qdiff','4',
+                     '-y',
+                     $intermediate);
+      $logger->(LOG_INFO, 'Executing "%s"', join(' ', @command));
+      {exec(@command)}
+      croak('ffmpeg exec failed on ' . join(' ', @command));
+    }
+
+    push(@$cleanup_list, $intermediate);
+
+    my $mplayer_failed = 0;
+    my $ffmpeg_failed  = 0;
+
+    while ( $ffmpeg || $mplayer )
+    {
+      my $child_pid = wait;
+      if ( $child_pid == $ffmpeg )
+      {
+        $ffmpeg  = 0;
+        $ffmpeg_failed = $?;
+        kill(15, $mplayer) if $ffmpeg_failed && $mplayer;
+      }
+      elsif ( $child_pid == $mplayer )
+      {
+        $mplayer = 0;
+        $mplayer_failed = $?;
+        kill(15, $ffmpeg) if $mplayer_failed && $ffmpeg;
+      }
+    }
+
+    unless ( $mplayer_failed || $ffmpeg_failed )
+    {
+      my @command = ('ffmpeg',
+                     '-i', $source,
+                     '-i', $intermediate,
+                     '-acodec', 'libfaac',
+                     '-b:a', '128k',
+                     '-ac', '2',
+                     '-vcodec', 'copy',
+                     '-f', 'ipod',
+                     '-map', '0:a',
+                     '-map', '1:v',
+                     '-metadata', "title=$title",
+                     '-y', $destination);
+      $logger->(LOG_INFO, 'Executing "%s"', join(' ', @command));
+      croak('ffmpeg multiplex failed') unless system(@command) >> 8 == 0;
+      unlink($intermediate);
+    }
+    else
+    {
+      $logger->(LOG_WARN, 'Not multiplexing, as earlier phase failed (mplayer: %d; ffmpeg: %d)',
+                $mplayer_failed, $ffmpeg_failed);
+    }
+  };
 }
 
 =head2 numbered_title_for
